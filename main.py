@@ -68,11 +68,24 @@ def main() -> int:
         default="local",
         help="Execution mode (temporal added in Stage 7)",
     )
+    parser.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        default=False,
+        help="Disable Docker sandboxing (trusted dev mode only; default: sandbox enabled)",
+    )
     args = parser.parse_args()
 
     if args.mode == "temporal":
         logger.error("Temporal mode is not available until Stage 7.")
         return 1
+
+    if args.no_sandbox:
+        import src.tools.runners as _runners
+        _runners.SANDBOX_ENABLED = False
+        logger.warning("Sandbox DISABLED (--no-sandbox flag set). Running tools on host.")
+    else:
+        logger.info("Sandbox ENABLED (default). Tools will execute inside Docker.")
 
     state = run_local(args.goal)
     return 0 if state.current_phase == "done" else 1

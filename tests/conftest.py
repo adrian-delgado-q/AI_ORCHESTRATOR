@@ -22,3 +22,14 @@ def stub_load_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     import src.agents.nodes as nodes_mod
 
     monkeypatch.setattr(nodes_mod, "load_llm", lambda *args, **kwargs: StubLLM())
+
+
+@pytest.fixture(autouse=True)
+def disable_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable Docker sandbox for all tests.
+
+    Stage 5 tests that need the real sandbox path mock SandboxManager directly.
+    This fixture prevents any test from accidentally spawning Docker containers.
+    """
+    import src.tools.runners as runners_mod
+    monkeypatch.setattr(runners_mod, "SANDBOX_ENABLED", False)

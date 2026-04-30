@@ -18,7 +18,7 @@ dependencies = [
     # Stage 4
     "litellm>=1.0",
     # Stage 5
-    # "docker>=7.0",
+    "docker>=7.0",
     # Stage 6
     # "zep-python", "graphiti-core",
     # Stage 7

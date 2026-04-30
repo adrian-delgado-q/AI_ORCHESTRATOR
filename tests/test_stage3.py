@@ -143,12 +143,18 @@ class TestToolRunnersUnit:
         assert ev.tool_name == "pip-audit"
         assert ev.passed is True
 
-    def test_run_complexity_check_always_passes(self):
+    def test_run_complexity_check_returns_tool_evidence(self, monkeypatch):
+        # Stage 5: run_complexity_check is real (xenon), not a stub.
+        # Mock subprocess so the test doesn't depend on the volume existing.
         import src.tools.runners as runners
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **kw: _completed_result(0, stdout=""),
+        )
         ev = runners.run_complexity_check("dummy-run", max_complexity=10)
         assert ev.tool_name == "complexity"
         assert ev.passed is True
-        assert "Stub" in ev.findings
+        assert "Stub" not in ev.findings  # real implementation, not a stub
 
     def test_all_runners_return_tool_evidence(self, monkeypatch):
         """Smoke: every runner returns a properly typed ToolEvidence."""
