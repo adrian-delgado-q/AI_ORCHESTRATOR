@@ -31,14 +31,16 @@ def run_in_sandbox(
     cmd: list[str],
     image: str = "omega-python-runner",
     timeout_seconds: int = 120,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
     """Execute *cmd* inside a fresh ephemeral sandbox and return ``(exit_code, output)``.
 
     The sandbox container is always destroyed after execution, even on error.
+    *env* is forwarded to the container as extra environment variables.
     """
     manager = get_sandbox_manager()
     container_ref = manager.create_sandbox(run_id=run_id, image=image)
     try:
-        return manager.exec_in_sandbox(container_ref, cmd, timeout_seconds=timeout_seconds)
+        return manager.exec_in_sandbox(container_ref, cmd, timeout_seconds=timeout_seconds, env=env)
     finally:
         manager.destroy_sandbox(container_ref)

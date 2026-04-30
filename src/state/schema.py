@@ -28,6 +28,10 @@ class ToolEvidence(BaseModel):
     passed: bool
     findings: str
     diagnosis: Optional[str] = None  # populated by DiagnosticUtility in Stage 4
+    # Semantic category — language/tool agnostic. Nodes filter by role, never
+    # by tool name, so swapping ruff→eslint or pytest→jest requires no node changes.
+    # Values: linter | test | security | audit | complexity
+    role: str = ""
 
 
 class SDLCState(BaseModel):

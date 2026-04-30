@@ -16,7 +16,7 @@ import re
 
 from src.agents.diagnostic import DiagnosticUtility
 from src.core.llm import BaseLLM, load_llm
-from src.io.workspace import write_file
+from src.io.workspace import VOLUMES_DIR, write_file
 from src.state.schema import SDLCRequirement, SDLCState, ToolEvidence
 from src.tools.runners import (
     run_bandit,
@@ -25,6 +25,7 @@ from src.tools.runners import (
     run_pip_audit,
     run_pytest,
     run_ruff,
+    run_ruff_fix,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,15 +80,117 @@ def _extract_json(text: str) -> str:
     return text
 
 
-def _diagnosis_context(gate_evidence: list[ToolEvidence]) -> str:
-    """Build a human-readable summary of prior loop diagnoses for dev prompts."""
-    failed = [e for e in gate_evidence if not e.passed and e.diagnosis]
+def gate_failure_context(
+    gate_evidence: list[ToolEvidence],
+    roles: set[str] | None = None,
+) -> str:
+    """Generic failure context block for any node prompt.
+
+    Filters failures by *roles* (e.g. {'linter'}, {'test'}) — or returns all
+    failures when *roles* is None.  Includes the full raw tool output so the
+    LLM sees actual file:line errors, not a truncated paraphrase.
+
+    Language/tool agnostic: callers request by role, never by tool name, so
+    swapping ruff→eslint or pytest→jest requires no node changes.
+    """
+    failed = [
+        e for e in gate_evidence
+        if not e.passed and (roles is None or e.role in roles)
+    ]
     if not failed:
         return ""
-    lines = ["Prior review loop failures (fix these):\n"]
+    lines = ["PRIOR REVIEW LOOP FAILURES — you MUST fix all of these:\n"]
     for e in failed:
-        lines.append(f"  [{e.tool_name}] {e.diagnosis}\n")
-    return "".join(lines)
+        lines.append(f"\n=== [{e.tool_name} / role={e.role}] ===")
+        if e.diagnosis:
+            lines.append(f"Diagnosis: {e.diagnosis}")
+        lines.append(f"Full output:\n{e.findings}")
+    return "\n".join(lines)
+
+
+def _inspect_module_exports(file_path) -> str:
+    """Return a human-readable summary of top-level public names in a Python file.
+
+    Uses ast.parse so it works before the module can be imported.  Safe to call
+    even if the file does not exist or has a syntax error — returns a fallback
+    message in those cases so callers never need to handle exceptions.
+
+    Examples of output lines:
+      router: APIRouter()         ← module-level assignment
+      app: FastAPI()              ← module-level assignment
+      todos: list                 ← module-level assignment (bare list literal)
+      Todo: class(BaseModel)      ← class definition
+      create_todo: function       ← function definition
+    """
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    path = _Path(file_path)
+    if not path.exists():
+        return "(impl file not found — cannot inspect exports)"
+    try:
+        tree = _ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        return f"(syntax error in impl file — cannot inspect exports: {exc})"
+
+    exports: list[str] = []
+    for node in tree.body:
+        if isinstance(node, _ast.Assign):
+            # e.g. router = APIRouter()  /  app = FastAPI()  /  todos = []
+            for target in node.targets:
+                if not isinstance(target, _ast.Name) or target.id.startswith("_"):
+                    continue
+                name = target.id
+                val = node.value
+                if isinstance(val, _ast.Call):
+                    func_name = ""
+                    if isinstance(val.func, _ast.Name):
+                        func_name = val.func.id
+                    elif isinstance(val.func, _ast.Attribute):
+                        func_name = val.func.attr
+                    exports.append(f"{name}: {func_name}()" if func_name else f"{name}: (assigned)")
+                elif isinstance(val, _ast.List):
+                    exports.append(f"{name}: list")
+                elif isinstance(val, _ast.Dict):
+                    exports.append(f"{name}: dict")
+                else:
+                    exports.append(f"{name}: (assigned)")
+        elif isinstance(node, _ast.AnnAssign):
+            # e.g. todos: list[Todo] = []
+            if isinstance(node.target, _ast.Name) and not node.target.id.startswith("_"):
+                exports.append(f"{node.target.id}: (annotated assignment)")
+        elif isinstance(node, _ast.ClassDef) and not node.name.startswith("_"):
+            bases = ", ".join(
+                (b.id if isinstance(b, _ast.Name) else b.attr if isinstance(b, _ast.Attribute) else "?")
+                for b in node.bases
+            )
+            exports.append(f"{node.name}: class({bases})" if bases else f"{node.name}: class")
+        elif isinstance(node, _ast.FunctionDef) and not node.name.startswith("_"):
+            exports.append(f"{node.name}: function")
+        elif isinstance(node, (_ast.AsyncFunctionDef,)) and not node.name.startswith("_"):
+            exports.append(f"{node.name}: async function")
+
+    if not exports:
+        return "(no public top-level names found in impl file)"
+    return "\n  ".join(exports)
+
+
+def _extract_import_errors(evidence: list[ToolEvidence]) -> list[tuple[str, str, str]]:
+    """Parse pytest findings for ImportError: cannot import name 'X' from 'Y'.
+
+    Returns a list of (test_file, imported_name, impl_module) tuples.
+    """
+    import re as _re
+    pattern = _re.compile(
+        r"(tests/test_\S+\.py).*?ImportError.*?cannot import name '(\w+)' from '(\w+)'",
+        _re.DOTALL,
+    )
+    results = []
+    for ev in evidence:
+        if ev.findings:
+            for m in pattern.finditer(ev.findings):
+                results.append((m.group(1), m.group(2), m.group(3)))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +299,17 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
 
     _llm = llm or load_llm("main")
     arch_context = f"\nArchitecture context:\n{state.architecture_doc}\n" if state.architecture_doc else ""
-    diag_context = _diagnosis_context(state.gate_evidence)
+    diag_context = gate_failure_context(state.gate_evidence, roles={"linter", "local_module"})
+
+    # Remove stale implementation files from previous runs/loops so ruff never
+    # sees orphaned files that no longer correspond to current requirements.
+    src_dir = VOLUMES_DIR / state.run_id / "src"
+    if src_dir.exists():
+        for old_file in src_dir.glob("req_*_impl.py"):
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
 
     changes = []
     for req in state.requirements:
@@ -210,6 +323,12 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             "- Use type hints throughout.\n"
             "- Functions must have docstrings.\n"
             "- Do not use external libraries unless explicitly required.\n"
+            "- IMPORT ORDER IS CRITICAL: ALL import and from-import statements MUST appear\n"
+            "  at the very top of the file, immediately after the first comment line,\n"
+            "  before ANY class or function definitions. Never add an import after a class,\n"
+            "  function, or any executable statement. ruff will fail with E402 otherwise.\n"
+            "- If you need fastapi.APIRouter, import it in the top-level imports block,\n"
+            "  not after your model or storage classes.\n"
         ).format(req_id=req.id)
 
         user_content = (
@@ -227,6 +346,10 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         ]
 
         code = _llm.chat(messages).strip()
+        # Strip markdown fences the LLM sometimes wraps around code blocks.
+        # Leaving them in causes E999 SyntaxError in ruff on every loop 1.
+        code = re.sub(r"^```[^\n]*\n", "", code)
+        code = re.sub(r"\n```$", "", code).strip()
         tag = f"# Requirement: {req.id}"
         if not code.startswith(tag):
             code = f"{tag}\n{code}"
@@ -242,6 +365,56 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         logger.info("[Dev] Wrote %s (%d chars).", rel_path, len(code))
 
     state.files_changed = changes
+
+    # ---- Generate requirements.txt from src/ AND existing tests/ ----
+    # Scanning both dirs ensures test-only deps (e.g. httpx for TestClient,
+    # requests-mock, etc.) are included alongside runtime deps.
+    all_files: list[FileChange] = list(changes) + list(state.tests_written)
+    all_code = "\n\n".join(
+        f"# --- {fc.path} ---\n" + (VOLUMES_DIR / state.run_id / fc.path).read_text(encoding="utf-8")
+        for fc in all_files
+        if fc.path.endswith(".py") and (VOLUMES_DIR / state.run_id / fc.path).exists()
+    )
+    req_system = (
+        "You are a dependency analyst.\n"
+        "Given source and test files, output ONLY a valid requirements file\n"
+        "with one package per line, no version pins unless critical.\n"
+        "Include ALL third-party packages needed at both runtime AND test time.\n"
+        "No comments. No extras."
+    )
+    req_user = f"Produce requirements.txt for this project:\n\n{all_code[:10000]}"
+    req_content = _llm.chat([
+        {"role": "system", "content": req_system},
+        {"role": "user", "content": req_user},
+    ]).strip()
+    # Strip any markdown fencing the LLM might add
+    req_content = re.sub(r"^```[^\n]*\n", "", req_content)
+    req_content = re.sub(r"\n```$", "", req_content).strip()
+    write_file(
+        run_id=state.run_id,
+        path="requirements.txt",
+        content=req_content + "\n",
+        requirement_id="DEPS",
+        rationale="LLM-inferred runtime dependencies for the generated project.",
+    )
+    logger.info("[Dev] Wrote requirements.txt.")
+
+    # Invalidate any cached .deps so the next review cycle re-installs fresh.
+    import shutil
+    deps_cache = VOLUMES_DIR / state.run_id / ".deps"
+    if deps_cache.exists():
+        try:
+            shutil.rmtree(deps_cache)
+            logger.info("[Dev] Cleared .deps cache — will reinstall on next review.")
+        except PermissionError:
+            # Docker writes .deps as root; mark as stale instead of deleting.
+            # _ensure_deps_installed will see this marker and force reinstall.
+            (VOLUMES_DIR / state.run_id / ".deps-stale").touch()
+            logger.info("[Dev] Cannot remove .deps (root-owned); wrote .deps-stale marker.")
+    # Also clear the in-process install cache so runners.py re-runs install_deps.
+    import src.tools.runners as _runners
+    _runners._deps_installed.discard(state.run_id)
+
     state.current_phase = "testing"
     logger.info("[Dev] Done. %d files written.", len(state.files_changed))
     return state
@@ -256,6 +429,19 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
     state.current_phase = "testing"
 
     _llm = llm or load_llm("main")
+    # Include linter, import_mismatch, and test failures.
+    # import_mismatch carries the real impl exports so the LLM stops guessing.
+    test_ctx = gate_failure_context(state.gate_evidence, roles={"test", "linter", "import_mismatch"})
+
+    # Remove stale test files from previous runs/loops so ruff/pytest never
+    # see orphaned tests that no longer correspond to current requirements.
+    tests_dir = VOLUMES_DIR / state.run_id / "tests"
+    if tests_dir.exists():
+        for old_file in tests_dir.glob("test_req_*.py"):
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
 
     tests = []
     for req in state.requirements:
@@ -264,19 +450,41 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         impl_path = f"src/{impl_module}.py"
 
         system_prompt = (
-            "You are a senior QA engineer writing pytest test files.\n"
+            "You are a senior QA engineer writing pytest test files for FastAPI projects.\n"
             "Rules:\n"
             "- Output ONLY the Python test file. No markdown. No explanation.\n"
             "- The FIRST line must be exactly: # Requirement: {req_id}\n"
-            "- Import the implementation module using sys.path manipulation:\n"
+            "- IMPORT ORDER: The sys.path block MUST come immediately after the first comment\n"
+            "  line and BEFORE all other imports, like this (copy exactly):\n"
             "    import sys\n"
             "    from pathlib import Path\n"
             "    sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))\n"
+            "  Then all other imports follow (no # noqa comment needed).\n"
             "- Each test function must start with 'def test_'.\n"
             "- Cover every acceptance criterion with at least one test.\n"
             "- Tests must be self-contained (no fixtures requiring external services).\n"
             "- Use type hints.\n"
-        ).format(req_id=req.id)
+            "- FASTAPI TESTING: Use starlette.testclient.TestClient, NOT Flask test_client().\n"
+            "  Correct pattern:\n"
+            "    from starlette.testclient import TestClient\n"
+            "    client = TestClient(app)   # app is a FastAPI() instance\n"
+            "    response = client.post('/todos', json={{'title': 'x'}})\n"
+            "    assert response.status_code == 201\n"
+            "    data = response.json()     # NOT response.get_json()\n"
+            "- NEVER use app.test_client() or response.get_json() -- those are Flask APIs.\n"
+            "- If the implementation module exposes a router (APIRouter) rather than a\n"
+            "  bare FastAPI app, create a minimal test app:\n"
+            "    from fastapi import FastAPI\n"
+            "    from {impl_module} import router\n"
+            "    app = FastAPI(); app.include_router(router)\n"
+            "    client = TestClient(app)\n"
+        ).format(req_id=req.id, impl_module=impl_module)
+
+        # Read the actual impl file to get ground-truth public names.
+        # This prevents the LLM from guessing 'router' when the file
+        # exposes 'app', or vice versa.
+        impl_abs = VOLUMES_DIR / state.run_id / impl_path
+        impl_exports = _inspect_module_exports(impl_abs)
 
         user_content = (
             f"Requirement ID: {req.id}\n"
@@ -284,6 +492,8 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             f"Acceptance criteria:\n"
             + "\n".join(f"  - {c}" for c in req.acceptance_criteria)
             + f"\nImplementation module to test: {impl_module} (file: {impl_path})"
+            + f"\n\nACTUAL public names exported by {impl_module} (MUST use only these):\n  {impl_exports}"
+            + (f"\n\n{test_ctx}" if test_ctx else "")
         )
 
         messages = [
@@ -292,6 +502,9 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         ]
 
         code = _llm.chat(messages).strip()
+        # Strip markdown fences — same issue as dev_node, kills E999 on loop 1.
+        code = re.sub(r"^```[^\n]*\n", "", code)
+        code = re.sub(r"\n```$", "", code).strip()
         tag = f"# Requirement: {req.id}"
         if not code.startswith(tag):
             code = f"{tag}\n{code}"
@@ -315,6 +528,23 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
 # ---------------------------------------------------------------------------
 # 4. Review — deterministic gates + LLM diagnosis
 # ---------------------------------------------------------------------------
+
+def _extract_missing_modules(evidence: list[ToolEvidence]) -> set[str]:
+    """Parse all gate findings for 'ModuleNotFoundError: No module named X'.
+
+    Returns a set of bare package names that need to be added to
+    requirements.txt.  Works for any language toolchain that surfaces the
+    standard Python import error message — no hardcoded package names.
+    """
+    import re as _re
+    missing: set[str] = set()
+    pattern = _re.compile(r"No module named '([\w]+)'")  # 'httpx', 'pydantic', …
+    for ev in evidence:
+        if ev.findings:
+            for match in pattern.finditer(ev.findings):
+                missing.add(match.group(1))
+    return missing
+
 
 def review_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
     logger.info("[Review] Running quality gates...")
@@ -345,7 +575,158 @@ def review_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
                 logger.warning("[Review] Diagnosis failed for %s: %s", ev.tool_name, exc)
                 ev.diagnosis = f"Diagnosis unavailable: {exc}"
 
+    # ── Import-mismatch evidence ──────────────────────────────────────────────
+    # Parse pytest output for "cannot import name 'X' from 'Y'" errors.
+    # For each mismatch, read the impl file with AST and build a ToolEvidence
+    # that carries the ACTUAL exports — so qa_node stops guessing wrong names.
+    import_errors = _extract_import_errors(evidence)
+    if import_errors:
+        mismatch_parts: list[str] = []
+        seen_modules: set[str] = set()
+        for (test_file, imported_name, impl_module) in import_errors:
+            impl_abs = VOLUMES_DIR / state.run_id / f"src/{impl_module}.py"
+            exports = _inspect_module_exports(impl_abs)
+            mismatch_parts.append(
+                f"{test_file}: tried to import '{imported_name}' from '{impl_module}'.\n"
+                f"  Actual exports in {impl_module}:\n    {exports}"
+            )
+            seen_modules.add(impl_module)
+        mismatch_findings = (
+            "IMPORT CONTRACT MISMATCH — tests import names that don't exist in the impl.\n"
+            "You MUST rewrite the tests to use only the names listed under 'Actual exports'.\n\n"
+            + "\n\n".join(mismatch_parts)
+        )
+        mismatch_ev = ToolEvidence(
+            tool_name="import_contract",
+            passed=False,
+            role="import_mismatch",
+            findings=mismatch_findings,
+            diagnosis="Test imports names not present in impl. Use actual exports only.",
+        )
+        evidence = list(evidence) + [mismatch_ev]
+        state.gate_evidence = evidence
+        logger.warning(
+            "[Review] Import contract mismatches detected (%d). Injected import_mismatch evidence.",
+            len(import_errors),
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     state.gate_evidence = evidence
+
+    # ── Ruff auto-fix short-circuit ───────────────────────────────────────────
+    # Always run FIRST — it is purely local file surgery, no network, no LLM.
+    # If all ruff errors carry the [*] fixable marker, apply --fix in-place and
+    # loop back to review.  loop_count NOT incremented.
+    # If mixed fixable+non-fixable, apply --fix to reduce noise then fall
+    # through to the LLM loop for the remainder.
+    ruff_ev = next((e for e in evidence if e.tool_name == "ruff" and not e.passed), None)
+    if ruff_ev is not None:
+        findings_lines = (ruff_ev.findings or "").splitlines()
+        error_lines = [l for l in findings_lines if ".py:" in l and ": " in l and not l.startswith("Found")]
+        fixable = [l for l in error_lines if "[*]" in l]
+        non_fixable = [l for l in error_lines if "[*]" not in l]
+        if fixable and not non_fixable:
+            logger.info(
+                "[Review] Ruff: %d auto-fixable error(s), 0 non-fixable — applying ruff --fix.",
+                len(fixable),
+            )
+            rc, fix_out = run_ruff_fix(state.run_id)
+            logger.info("[Review] ruff --fix exit=%d: %s", rc, fix_out[:200] if fix_out else "(no output)")
+            state.current_phase = "review"
+            logger.info("[Review] Ruff auto-fix applied — re-running gates.")
+            return state
+        elif fixable and non_fixable:
+            logger.info(
+                "[Review] Ruff: %d auto-fixable + %d non-fixable — applying --fix, routing to dev for remainder.",
+                len(fixable), len(non_fixable),
+            )
+            run_ruff_fix(state.run_id)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Dynamic dep resolution ────────────────────────────────────────────────
+    # If any gate printed "No module named 'X'", try to install X from PyPI.
+    # Call install_deps eagerly right here so we know immediately whether pip
+    # can satisfy the module or not — rather than blindly returning and hoping.
+    #
+    # Success (rc==0) → loop_count unchanged, loop back to review.
+    # Failure (rc!=0) → X is a hallucinated local file, not a PyPI package.
+    #   Strip the bad entry from requirements.txt, add a ToolEvidence with
+    #   role='local_module' so dev_node sees the exact error, and route to dev.
+    missing_mods = _extract_missing_modules(evidence)
+    if missing_mods:
+        req_path = VOLUMES_DIR / state.run_id / "requirements.txt"
+        existing_reqs: set[str] = set()
+        if req_path.exists():
+            existing_reqs = {line.strip().lower() for line in req_path.read_text().splitlines() if line.strip()}
+        new_mods = {m for m in missing_mods if m.lower() not in existing_reqs}
+        if new_mods:
+            logger.warning(
+                "[Review] Missing modules detected: %s — patching requirements.txt.",
+                sorted(new_mods),
+            )
+            with req_path.open("a") as fh:
+                for mod in sorted(new_mods):
+                    fh.write(f"{mod}\n")
+        else:
+            logger.warning(
+                "[Review] Missing modules %s already in requirements.txt — forcing reinstall.",
+                sorted(missing_mods),
+            )
+
+        # Eager install — we need the return code NOW.
+        import src.tools.runners as _runners
+        _runners._deps_installed.discard(state.run_id)
+        stale = VOLUMES_DIR / state.run_id / ".deps-stale"
+        if stale.exists():
+            stale.unlink(missing_ok=True)
+        from src.sandbox.manager import get_sandbox_manager
+        install_rc, install_out = get_sandbox_manager().install_deps(state.run_id)
+        _runners._deps_installed.add(state.run_id)
+
+        if install_rc == 0:
+            # Real PyPI packages — reinstall succeeded, re-run gates.
+            logger.info("[Review] Dep install succeeded — re-running gates.")
+            state.current_phase = "review"
+            return state
+        else:
+            # pip cannot install the module → it is a fabricated local import.
+            # Strip the bad entries from requirements.txt so they don't keep
+            # poisoning future installs.
+            bad_mods = {m.lower() for m in missing_mods}
+            if req_path.exists():
+                clean_lines = [
+                    line for line in req_path.read_text().splitlines()
+                    if line.strip().lower() not in bad_mods
+                ]
+                req_path.write_text("\n".join(clean_lines) + "\n")
+                logger.warning(
+                    "[Review] Removed non-installable entries from requirements.txt: %s",
+                    sorted(bad_mods),
+                )
+            # Inject a synthetic ToolEvidence so dev_node gets the full context.
+            local_mod_evidence = ToolEvidence(
+                tool_name="local_module_import",
+                passed=False,
+                role="local_module",
+                findings=(
+                    f"pip install failed for: {sorted(missing_mods)}\n"
+                    f"pip output:\n{install_out[:600]}\n\n"
+                    "These are NOT PyPI packages — the implementation file contains a "
+                    "'from <name> import ...' that references a non-existent local module.\n"
+                    "Fix: inline the class/function directly in the impl file instead of "
+                    "importing from a separate module that does not exist."
+                ),
+                diagnosis="LLM generated an import from a local file that was never created.",
+            )
+            state.gate_evidence = list(evidence) + [local_mod_evidence]
+            state.loop_count += 1
+            state.current_phase = "implementation"
+            logger.warning(
+                "[Review] Non-installable local imports %s — routing to dev. Loop %d.",
+                sorted(missing_mods), state.loop_count,
+            )
+            return state
+    # ─────────────────────────────────────────────────────────────────────────
 
     required_failed = [
         e for e in evidence if e.tool_name in _REQUIRED_TOOLS and not e.passed

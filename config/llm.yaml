@@ -3,7 +3,7 @@
 # DEEPSEEK_API_KEY must be set in the environment.
 
 main:
-  model: deepseek/deepseek-v4-pro
+  model: deepseek/deepseek-v4-flash
   api_key_env: DEEPSEEK_API_KEY
   temperature: 0.2
   max_tokens: 4096

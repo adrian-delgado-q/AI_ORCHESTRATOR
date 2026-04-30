@@ -75,11 +75,57 @@ class SandboxManager:
         logger.debug("[Sandbox] Created container %s (image=%s, run_id=%s)", container.id[:12], image, run_id)
         return ContainerRef(container_id=container.id, run_id=run_id, image=image)
 
+    def install_deps(
+        self,
+        run_id: str,
+        image: str = PYTHON_RUNNER_IMAGE,
+    ) -> tuple[int, str]:
+        """Install /workspace/requirements.txt into /workspace/.deps using a
+        short-lived network-enabled container.
+
+        Dependencies land in ``/workspace/.deps`` (on the host volume) so the
+        network-disabled QA containers can import them by adding that path to
+        ``PYTHONPATH``.  Safe to call multiple times — pip is idempotent.
+        """
+        import docker  # type: ignore[import]
+
+        client = docker.from_env()
+        host_workspace = str(VOLUMES_DIR.resolve() / run_id)
+
+        logger.info("[Sandbox] Installing deps for run_id=%s into /workspace/.deps", run_id)
+        try:
+            result = client.containers.run(
+                image,
+                command=[
+                    "pip", "install", "-q",
+                    "-r", "/workspace/requirements.txt",
+                    "--target", "/workspace/.deps",
+                ],
+                detach=False,
+                network_disabled=False,  # needs internet to fetch packages
+                volumes={host_workspace: {"bind": "/workspace", "mode": "rw"}},
+                mem_limit="512m",
+                remove=True,
+                stdout=True,
+                stderr=True,
+            )
+            output = result.decode("utf-8", errors="replace").strip() if result else ""
+            logger.info("[Sandbox] Dep install complete for run_id=%s", run_id)
+            return 0, output
+        except Exception as exc:  # docker.errors.ContainerError carries exit_code
+            import docker.errors  # type: ignore[import]
+            if isinstance(exc, docker.errors.ContainerError):
+                output = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else str(exc)
+                logger.warning("[Sandbox] Dep install failed (exit=%d): %s", exc.exit_status, output[:200])
+                return exc.exit_status, output
+            raise
+
     def exec_in_sandbox(
         self,
         container_ref: ContainerRef,
         cmd: list[str],
         timeout_seconds: int = 120,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str]:
         """Run *cmd* inside the sandbox container.
 
@@ -99,6 +145,7 @@ class SandboxManager:
             stderr=True,
             demux=False,
             workdir="/workspace",
+            environment=env or {},
             # The docker SDK does not natively support exec timeout;
             # rely on the container's own resource limits for runaway processes.
             # A future Stage 8 Temporal activity wraps this with asyncio timeout.

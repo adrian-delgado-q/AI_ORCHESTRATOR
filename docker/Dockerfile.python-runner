@@ -25,6 +25,11 @@ RUN pip install --no-cache-dir \
     radon==6.* \
     xenon==0.9.*
 
+# Runtime dependencies are NOT installed here.
+# Each generated project supplies a requirements.txt in its workspace root.
+# The sandbox runner installs them dynamically at review time via:
+#   pip install -q -r /workspace/requirements.txt
+
 WORKDIR /workspace
 
 # Default command — overridden by exec_run in SandboxManager

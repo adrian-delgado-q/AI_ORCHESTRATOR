@@ -23,8 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_local(goal_path: str) -> SDLCState:
-    """Load a goal file and run the Omega graph in local mode."""
+def run_local(goal_path: str, resume: bool = False) -> SDLCState:
+    """Load a goal file and run the Omega graph in local mode.
+
+    When *resume* is True and a prior state exists for the run_id, the saved
+    state is loaded and the graph continues from where it left off.
+    """
+    from src.state.persistence import load_state
+
     logger.info("Loading goal from: %s", goal_path)
     goal = load_goal(goal_path)
     logger.info("Goal validated: %s — %s", goal.goal_id, goal.objective)
@@ -34,10 +40,37 @@ def run_local(goal_path: str) -> SDLCState:
     volume_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Volume directory provisioned: %s", volume_dir)
 
-    # Initialise state from goal
-    initial_state = SDLCState.from_goal(goal)
-    save_state(initial_state)
-    logger.info("Initial state saved.")
+    # Load or initialise state
+    if resume:
+        try:
+            initial_state = load_state(goal.goal_id)
+            logger.info(
+                "Resuming run '%s' from phase='%s' (loop=%d).",
+                goal.goal_id, initial_state.current_phase, initial_state.loop_count,
+            )
+        except FileNotFoundError:
+            logger.warning("No saved state for '%s' — starting fresh.", goal.goal_id)
+            initial_state = SDLCState.from_goal(goal)
+            save_state(initial_state)
+    else:
+        initial_state = SDLCState.from_goal(goal)
+        save_state(initial_state)
+        logger.info("Initial state saved.")
+        # Clear cached deps so the new run re-installs from scratch
+        deps_dir = volume_dir / ".deps"
+        stale = volume_dir / ".deps-stale"
+        if deps_dir.exists():
+            import shutil
+            try:
+                shutil.rmtree(deps_dir)
+                stale.unlink(missing_ok=True)  # clean state
+                logger.info("Cleared stale .deps cache for fresh run.")
+            except PermissionError:
+                # Docker wrote .deps as root; mark stale to force reinstall
+                stale.touch()
+                logger.info(".deps owned by root — marked stale, will reinstall on next review.")
+        else:
+            stale.unlink(missing_ok=True)  # nothing to install, no stale marker needed
 
     # Run the graph (LangGraph returns the final dict state)
     logger.info("─" * 60)
@@ -74,6 +107,12 @@ def main() -> int:
         default=False,
         help="Disable Docker sandboxing (trusted dev mode only; default: sandbox enabled)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from the last saved checkpoint instead of starting fresh.",
+    )
     args = parser.parse_args()
 
     if args.mode == "temporal":
@@ -87,7 +126,7 @@ def main() -> int:
     else:
         logger.info("Sandbox ENABLED (default). Tools will execute inside Docker.")
 
-    state = run_local(args.goal)
+    state = run_local(args.goal, resume=args.resume)
     return 0 if state.current_phase == "done" else 1
 
 
