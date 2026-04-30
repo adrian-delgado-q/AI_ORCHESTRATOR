@@ -1,12 +1,14 @@
-"""Six stubbed LangGraph agent nodes — Stage 1.
+"""LangGraph agent nodes — Stage 2.
 
 Each node receives SDLCState, updates it, and returns it.
+Stage 2: dev_node and qa_node write real files via src.io.workspace.
 Real LLM calls are added in Stage 4.
 """
 from __future__ import annotations
 
 import logging
 
+from src.io.workspace import write_file
 from src.state.schema import SDLCRequirement, SDLCState, ToolEvidence
 
 logger = logging.getLogger(__name__)
@@ -57,22 +59,29 @@ def dev_node(state: SDLCState) -> SDLCState:
     logger.info("[Dev] Writing implementation files...")
     state.current_phase = "implementation"
 
-    # Stage 1: no real files written — Stage 2 adds write_file
-    # files_changed is populated with stubs to exercise the schema
-    from src.state.schema import FileChange
-
-    state.files_changed = [
-        FileChange(
-            path=f"src/{req.id.lower().replace('-', '_')}_impl.py",
+    changes = []
+    for req in state.requirements:
+        rel_path = f"src/{req.id.lower().replace('-', '_')}_impl.py"
+        content = (
+            f"# Requirement: {req.id}\n"
+            f"# {req.description}\n"
+            f"\n"
+            f"def stub_{req.id.lower().replace('-', '_')}():\n"
+            f"    \"\"\"Stub implementation — replaced by real code in Stage 4.\"\"\"\n"
+            f"    pass\n"
+        )
+        fc = write_file(
+            run_id=state.run_id,
+            path=rel_path,
+            content=content,
             requirement_id=req.id,
             rationale=f"Stub implementation for {req.id}: {req.description}",
-            hash="",  # real hash added in Stage 2
         )
-        for req in state.requirements
-    ]
+        changes.append(fc)
 
+    state.files_changed = changes
     state.current_phase = "testing"
-    logger.info("[Dev] Done. %d files stubbed.", len(state.files_changed))
+    logger.info("[Dev] Done. %d files written.", len(state.files_changed))
     return state
 
 
@@ -84,20 +93,29 @@ def qa_node(state: SDLCState) -> SDLCState:
     logger.info("[QA] Writing test files...")
     state.current_phase = "testing"
 
-    from src.state.schema import FileChange
-
-    state.tests_written = [
-        FileChange(
-            path=f"tests/test_{req.id.lower().replace('-', '_')}.py",
+    tests = []
+    for req in state.requirements:
+        rel_path = f"tests/test_{req.id.lower().replace('-', '_')}.py"
+        content = (
+            f"# Requirement: {req.id}\n"
+            f"# {req.description}\n"
+            f"\n"
+            f"def test_{req.id.lower().replace('-', '_')}():\n"
+            f"    \"\"\"Stub test — replaced by real tests in Stage 4.\"\"\"\n"
+            f"    pass\n"
+        )
+        fc = write_file(
+            run_id=state.run_id,
+            path=rel_path,
+            content=content,
             requirement_id=req.id,
             rationale=f"Stub tests for {req.id}: {req.description}",
-            hash="",
         )
-        for req in state.requirements
-    ]
+        tests.append(fc)
 
+    state.tests_written = tests
     state.current_phase = "review"
-    logger.info("[QA] Done. %d test files stubbed.", len(state.tests_written))
+    logger.info("[QA] Done. %d test files written.", len(state.tests_written))
     return state
 
 
