@@ -1,0 +1,15 @@
+# LLM configuration — Stage 4
+# All keys that are absent fall back to environment variables.
+# DEEPSEEK_API_KEY must be set in the environment.
+
+main:
+  model: deepseek/deepseek-v4-pro
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.2
+  max_tokens: 4096
+
+diagnostic:
+  model: deepseek/deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.0
+  max_tokens: 1024

@@ -59,6 +59,9 @@ class SDLCState(BaseModel):
     # Release
     release_notes: Optional[str] = None
 
+    # Supervisor (Stage 4)
+    supervisor_notes: Optional[str] = None
+
     # Graph control
     current_phase: Literal[
         "planning",

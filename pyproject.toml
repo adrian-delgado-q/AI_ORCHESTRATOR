@@ -16,7 +16,7 @@ dependencies = [
     # Stage 3 (tools — installed separately in dev env)
     # "ruff", "pytest", "mypy", "bandit", "pip-audit"
     # Stage 4
-    # "litellm>=1.0",
+    "litellm>=1.0",
     # Stage 5
     # "docker>=7.0",
     # Stage 6
