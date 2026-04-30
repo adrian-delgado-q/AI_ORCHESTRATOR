@@ -1,0 +1,15 @@
+goal_id: "auth-system-001"
+objective: "Implement a secure JWT-based authentication system for a FastAPI app."
+context: "The app uses PostgreSQL with SQLAlchemy. We need login and signup endpoints."
+technical_requirements:
+  - "Use Passlib with bcrypt for password hashing."
+  - "All endpoints must be asynchronous."
+  - "JWT secret must be loaded from environment variables."
+quality_thresholds:
+  max_cyclomatic_complexity: 8
+  min_test_coverage: 90
+  enforce_type_hints: true
+success_criteria:
+  - "User can register with email and password."
+  - "User can exchange credentials for a token."
+  - "Protected routes return 401 without a valid token."

@@ -1,0 +1,14 @@
+goal_id: "example-goal-001"
+objective: "Build a simple REST API for a todo list."
+context: "Standalone FastAPI app, no database required for this example."
+technical_requirements:
+  - "Use FastAPI with Pydantic models."
+  - "Endpoints must be async."
+quality_thresholds:
+  max_cyclomatic_complexity: 10
+  min_test_coverage: 80
+  enforce_type_hints: false
+success_criteria:
+  - "User can create a new todo item."
+  - "User can list all todo items."
+  - "User can delete a todo item by ID."

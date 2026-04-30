@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lean-omega"
+version = "0.1.0"
+description = "Lean Omega — SDLC Multi-Agent Orchestrator"
+requires-python = ">=3.10"
+dependencies = [
+    # Stage 1
+    "langgraph>=0.2",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    # Stage 2 (file IO — stdlib only, no extra deps)
+    # Stage 3 (tools — installed separately in dev env)
+    # "ruff", "pytest", "mypy", "bandit", "pip-audit"
+    # Stage 4
+    # "litellm>=1.0",
+    # Stage 5
+    # "docker>=7.0",
+    # Stage 6
+    # "zep-python", "graphiti-core",
+    # Stage 7
+    # "temporalio>=1.0",
+    # Stage 8
+    # "redis>=5.0",
+]
+
+[project.optional-dependencies]
+stage3 = ["ruff", "pytest", "pytest-cov", "mypy", "bandit", "pip-audit"]
+stage4 = ["litellm>=1.0"]
+stage5 = ["docker>=7.0"]
+stage6 = ["zep-python", "graphiti-core"]
+stage7 = ["temporalio>=1.0"]
+stage8 = ["redis>=5.0"]
+dev = ["pytest", "pytest-cov", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
