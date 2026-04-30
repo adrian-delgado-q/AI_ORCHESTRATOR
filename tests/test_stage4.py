@@ -344,6 +344,30 @@ class TestDevNode:
         result = dev_node(state, llm=llm)
         assert result.current_phase == "testing"
 
+    def test_parallel_generation_preserves_requirement_order(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+        import src.io.workspace as ws
+
+        class ReqAwareLLM:
+            def chat(self, messages: list[dict]) -> str:
+                content = messages[1]["content"]
+                req_id = "REQ-002" if "REQ-002" in content else "REQ-001"
+                if req_id == "REQ-001":
+                    time.sleep(0.03)
+                return f"# Requirement: {req_id}\ndef impl_{req_id.lower().replace('-', '_')}() -> None:\n    pass\n"
+
+        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path)
+        monkeypatch.setenv("OMEGA_LLM_CONCURRENCY", "2")
+        state = _make_state(requirements=[
+            SDLCRequirement(id="REQ-001", description="First", acceptance_criteria=[]),
+            SDLCRequirement(id="REQ-002", description="Second", acceptance_criteria=[]),
+        ])
+
+        result = dev_node(state, llm=ReqAwareLLM())
+
+        assert [fc.requirement_id for fc in result.files_changed] == ["REQ-001", "REQ-002"]
+        assert [fc.path for fc in result.files_changed] == ["src/req_001_impl.py", "src/req_002_impl.py"]
+
 
 # ---------------------------------------------------------------------------
 # 6. Tests: qa_node
@@ -379,6 +403,33 @@ class TestQaNode:
         state = _make_state()
         result = qa_node(state, llm=llm)
         assert result.current_phase == "review"
+
+    def test_parallel_generation_preserves_requirement_order(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+        import src.io.workspace as ws
+
+        class ReqAwareLLM:
+            def chat(self, messages: list[dict]) -> str:
+                content = messages[1]["content"]
+                req_id = "REQ-002" if "REQ-002" in content else "REQ-001"
+                if req_id == "REQ-001":
+                    time.sleep(0.03)
+                return f"# Requirement: {req_id}\ndef test_{req_id.lower().replace('-', '_')}() -> None:\n    pass\n"
+
+        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path)
+        monkeypatch.setenv("OMEGA_LLM_CONCURRENCY", "2")
+        state = _make_state(
+            requirements=[
+                SDLCRequirement(id="REQ-001", description="First", acceptance_criteria=[]),
+                SDLCRequirement(id="REQ-002", description="Second", acceptance_criteria=[]),
+            ],
+            files_changed=[],
+        )
+
+        result = qa_node(state, llm=ReqAwareLLM())
+
+        assert [fc.requirement_id for fc in result.tests_written] == ["REQ-001", "REQ-002"]
+        assert [fc.path for fc in result.tests_written] == ["tests/test_req_001.py", "tests/test_req_002.py"]
 
 
 # ---------------------------------------------------------------------------

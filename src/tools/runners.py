@@ -21,10 +21,16 @@ Both follow the same module-level constant pattern as ``src/io/workspace.py``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import shutil
 import subprocess
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
+from src.core.timing import timed
 from src.state.schema import ToolEvidence
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,8 @@ TOOL_TIMEOUT = 120
 # Avoids re-running pip install for every tool in the same review cycle.
 _deps_installed: set[str] = set()
 
+_active_sandbox = threading.local()
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -62,8 +70,32 @@ def _volume(run_id: str) -> Path:
 
 def _run_host(cmd: list[str]) -> tuple[int, str]:
     """Execute *cmd* on the host via subprocess (no-sandbox path)."""
+    resolved = shutil.which(cmd[0])
+    if resolved is None:
+        local_tool = Path(__file__).resolve().parents[2] / ".venv" / "bin" / cmd[0]
+        if local_tool.exists():
+            resolved = str(local_tool)
+    if resolved is not None:
+        cmd = [resolved, *cmd[1:]]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def _requirements_hash(req_file: Path) -> str:
+    return hashlib.sha256(req_file.read_bytes()).hexdigest()
+
+
+def _deps_hash_marker(run_id: str) -> Path:
+    return _volume(run_id) / ".deps-requirements.sha256"
+
+
+def _deps_hash_matches(run_id: str, req_hash: str) -> bool:
+    marker = _deps_hash_marker(run_id)
+    return marker.exists() and marker.read_text(encoding="utf-8").strip() == req_hash
+
+
+def _write_deps_hash(run_id: str, req_hash: str) -> None:
+    _deps_hash_marker(run_id).write_text(req_hash + "\n", encoding="utf-8")
 
 
 def _ensure_deps_installed(run_id: str) -> None:
@@ -74,27 +106,35 @@ def _ensure_deps_installed(run_id: str) -> None:
     Skips if requirements.txt is absent or deps have already been installed
     this process session.
     """
-    # Skip if deps are already installed this session AND not marked stale
     stale_marker = _volume(run_id) / ".deps-stale"
-    if run_id in _deps_installed and not stale_marker.exists():
-        return
     req_file = _volume(run_id) / "requirements.txt"
     if not req_file.exists():
         return
+    req_hash = _requirements_hash(req_file)
     # Skip for cross-session resume: .deps populated, no stale marker, not in current session
     deps_dir = _volume(run_id) / ".deps"
-    if deps_dir.exists() and any(deps_dir.iterdir()) and not stale_marker.exists() and run_id not in _deps_installed:
-        logger.info("[runners] .deps already populated for %s — skipping install.", run_id)
+    if (
+        deps_dir.exists()
+        and any(deps_dir.iterdir())
+        and not stale_marker.exists()
+        and _deps_hash_matches(run_id, req_hash)
+        and run_id not in _deps_installed
+    ):
+        logger.info("[runners] .deps already match requirements for %s — skipping install.", run_id)
         _deps_installed.add(run_id)
+        return
+    if run_id in _deps_installed and not stale_marker.exists() and _deps_hash_matches(run_id, req_hash):
         return
     from src.sandbox.manager import get_sandbox_manager
     manager = get_sandbox_manager()
-    rc, out = manager.install_deps(run_id)
+    with timed(run_id, "dependency_install", "pip_install", {"requirements_hash": req_hash}):
+        rc, out = manager.install_deps(run_id)
     if rc != 0:
         logger.warning("[runners] Dep install exited %d: %s", rc, out[:200])
         # Do NOT cache as installed on failure — let the next caller retry.
         return
     _deps_installed.add(run_id)
+    _write_deps_hash(run_id, req_hash)
     # Remove stale marker after successful install
     if stale_marker.exists():
         stale_marker.unlink(missing_ok=True)
@@ -117,8 +157,44 @@ def _exec(run_id: str, cmd: list[str], timeout: int = TOOL_TIMEOUT) -> tuple[int
         deps_dir = _volume(run_id) / ".deps"
         if deps_dir.exists():
             env["PYTHONPATH"] = "/workspace/.deps"
+        active = getattr(_active_sandbox, "container_ref", None)
+        if active is not None and active.run_id == run_id:
+            from src.sandbox.manager import get_sandbox_manager
+            return get_sandbox_manager().exec_in_sandbox(active, cmd, timeout_seconds=timeout, env=env)
         return run_in_sandbox(run_id=run_id, cmd=cmd, image=PYTHON_RUNNER_IMAGE, timeout_seconds=timeout, env=env)
     return _run_host(cmd)
+
+
+@contextmanager
+def shared_review_sandbox(run_id: str) -> Iterator[None]:
+    """Reuse one sandbox container for all sandboxed tools in a review cycle."""
+    if not SANDBOX_ENABLED:
+        yield
+        return
+
+    from src.sandbox.manager import get_sandbox_manager
+
+    _ensure_deps_installed(run_id)
+    manager = get_sandbox_manager()
+    container_ref = manager.create_sandbox(run_id=run_id, image=PYTHON_RUNNER_IMAGE)
+    previous = getattr(_active_sandbox, "container_ref", None)
+    _active_sandbox.container_ref = container_ref
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_active_sandbox, "container_ref")
+            except AttributeError:
+                pass
+        else:
+            _active_sandbox.container_ref = previous
+        manager.destroy_sandbox(container_ref)
+
+
+def _timed_exec(run_id: str, tool: str, cmd: list[str], timeout: int = TOOL_TIMEOUT) -> tuple[int, str]:
+    with timed(run_id, "tool", tool, {"cmd": " ".join(cmd)}):
+        return _exec(run_id, cmd, timeout=timeout)
 
 
 def _log_result(tool: str, passed: bool, findings: str, extra: str = "") -> None:
@@ -140,8 +216,9 @@ def run_ruff(run_id: str) -> ToolEvidence:
         cmd = ["ruff", "check", "/workspace/src/", "/workspace/tests/"]
     else:
         vol = _volume(run_id)
-        cmd = ["ruff", "check", str(vol / "src"), str(vol / "tests")]
-    returncode, output = _exec(run_id, cmd)
+        targets = [p for p in (vol / "src", vol / "tests") if p.exists()]
+        cmd = ["ruff", "check", *(str(p) for p in targets)]
+    returncode, output = _timed_exec(run_id, "ruff", cmd)
     passed = returncode == 0
     findings = output or "No lint issues found."
     _log_result("ruff", passed, findings)
@@ -160,7 +237,7 @@ def run_ruff_fix(run_id: str) -> tuple[int, str]:
     else:
         vol = _volume(run_id)
         cmd = ["ruff", "check", "--fix", str(vol / "src"), str(vol / "tests")]
-    return _exec(run_id, cmd)
+    return _timed_exec(run_id, "ruff_fix", cmd)
 
 
 def run_pytest(run_id: str, min_coverage: int = 80) -> ToolEvidence:
@@ -179,7 +256,7 @@ def run_pytest(run_id: str, min_coverage: int = 80) -> ToolEvidence:
             f"--cov-fail-under={min_coverage}",
             "--tb=short", "-v",
         ]
-    returncode, output = _exec(run_id, cmd)
+    returncode, output = _timed_exec(run_id, "pytest", cmd)
     passed = returncode == 0
     findings = output or "(no pytest output)"
     _log_result("pytest", passed, findings, extra=f"(coverage >= {min_coverage}%)")
@@ -197,7 +274,7 @@ def run_mypy(run_id: str, enforce: bool = True) -> ToolEvidence:
         cmd = ["mypy", "/workspace/src/", "--ignore-missing-imports"]
     else:
         cmd = ["mypy", str(_volume(run_id) / "src"), "--ignore-missing-imports"]
-    returncode, output = _exec(run_id, cmd)
+    returncode, output = _timed_exec(run_id, "mypy", cmd)
     passed = returncode == 0
     findings = output or "(no mypy output)"
     _log_result("mypy", passed, findings)
@@ -212,7 +289,7 @@ def run_bandit(run_id: str) -> ToolEvidence:
         cmd = ["bandit", "-r", "/workspace/src/", "-ll", "-ii"]
     else:
         cmd = ["bandit", "-r", str(_volume(run_id) / "src"), "-ll", "-ii"]
-    returncode, output = _exec(run_id, cmd)
+    returncode, output = _timed_exec(run_id, "bandit", cmd)
     passed = returncode == 0
     findings = output or "No security issues found."
     _log_result("bandit", passed, findings)
@@ -227,7 +304,7 @@ def run_pip_audit(run_id: str) -> ToolEvidence:
         cmd = ["pip-audit", "-r", "/workspace/requirements.txt"]
     else:
         cmd = ["pip-audit", "-r", str(req_file)]
-    returncode, output = _exec(run_id, cmd)
+    returncode, output = _timed_exec(run_id, "pip-audit", cmd)
     findings = output or "(no pip-audit output)"
     # pip-audit tries to upgrade pip/wheel/setuptools in a temp venv during
     # its own setup.  In a network-disabled sandbox this always fails with
@@ -267,7 +344,7 @@ def run_complexity_check(run_id: str, max_complexity: int = 10) -> ToolEvidence:
             "--max-average", "A",
             str(_volume(run_id) / "src"),
         ]
-    returncode, output = _exec(run_id, cmd)
+    returncode, output = _timed_exec(run_id, "complexity", cmd)
     passed = returncode == 0
     findings = output or ("Complexity OK." if passed else "(no xenon output)")
     _log_result("complexity", passed, findings, extra=f"(threshold={max_complexity})")

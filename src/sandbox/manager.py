@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,15 @@ VOLUMES_DIR = Path("volumes")
 # Default image name for Stage 5 (Python-only).
 # Stage 6 will parameterise this via TargetStack.image.
 PYTHON_RUNNER_IMAGE = "omega-python-runner"
+
+
+def _sandbox_cpu_quota() -> int:
+    raw = os.environ.get("OMEGA_SANDBOX_CPU_QUOTA", "100000")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("[Sandbox] Invalid OMEGA_SANDBOX_CPU_QUOTA=%r; using 100000.", raw)
+        return 100_000
 
 
 @dataclasses.dataclass
@@ -68,7 +78,7 @@ class SandboxManager:
             },
             mem_limit="512m",
             cpu_period=100_000,
-            cpu_quota=50_000,  # 50% of one CPU
+            cpu_quota=_sandbox_cpu_quota(),
             working_dir="/workspace",
             remove=False,  # we remove manually in destroy_sandbox
         )

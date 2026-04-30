@@ -265,6 +265,23 @@ class TestReviewNodeGating:
         assert state.current_phase == "release"
         assert state.loop_count == 0
 
+    def test_optional_tools_skipped_when_required_gate_fails_by_default(self, monkeypatch):
+        """Required failures route quickly without running slow optional gates."""
+        import src.agents.nodes as nodes
+
+        monkeypatch.setattr(nodes, "run_ruff", lambda run_id: self._make_failing_evidence("ruff"))
+        monkeypatch.setattr(nodes, "run_pytest", lambda run_id, min_coverage=80: self._make_passing_evidence("pytest"))
+        run_mypy = MagicMock(return_value=self._make_passing_evidence("mypy"))
+        monkeypatch.setattr(nodes, "run_mypy", run_mypy)
+        monkeypatch.setattr(nodes, "run_bandit", MagicMock(return_value=self._make_passing_evidence("bandit")))
+        monkeypatch.setattr(nodes, "run_pip_audit", MagicMock(return_value=self._make_passing_evidence("pip-audit")))
+        monkeypatch.setattr(nodes, "run_complexity_check", MagicMock(return_value=self._make_passing_evidence("complexity")))
+
+        state = nodes.review_node(_make_state())
+
+        assert state.current_phase == "implementation"
+        run_mypy.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # release_engineer_node — safety-net block

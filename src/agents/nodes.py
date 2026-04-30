@@ -12,12 +12,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from src.agents.diagnostic import DiagnosticUtility
 from src.core.llm import BaseLLM, load_llm
+from src.core.timing import timed
 from src.io.workspace import VOLUMES_DIR, write_file
-from src.state.schema import SDLCRequirement, SDLCState, ToolEvidence
+from src.state.schema import FileChange, SDLCRequirement, SDLCState, ToolEvidence
 from src.tools.runners import (
     run_bandit,
     run_complexity_check,
@@ -26,12 +31,34 @@ from src.tools.runners import (
     run_pytest,
     run_ruff,
     run_ruff_fix,
+    shared_review_sandbox,
 )
 
 logger = logging.getLogger(__name__)
 
 # Required gates — failure triggers a dev loop.
 _REQUIRED_TOOLS = {"ruff", "pytest"}
+
+_IMPORT_PACKAGE_MAP = {
+    "bs4": "beautifulsoup4",
+    "dotenv": "python-dotenv",
+    "fastapi": "fastapi",
+    "httpx": "httpx",
+    "jwt": "PyJWT",
+    "jose": "python-jose",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "passlib": "passlib",
+    "pydantic": "pydantic",
+    "pytest": "pytest",
+    "requests": "requests",
+    "sqlalchemy": "sqlalchemy",
+    "starlette": "starlette",
+    "uvicorn": "uvicorn",
+    "yaml": "PyYAML",
+}
+
+_COMMON_LOCAL_MODULE_PREFIXES = {"req_"}
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +107,75 @@ def _extract_json(text: str) -> str:
     return text
 
 
+def _llm_concurrency() -> int:
+    raw = os.environ.get("OMEGA_LLM_CONCURRENCY", "4")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("[config] Invalid OMEGA_LLM_CONCURRENCY=%r; using 4.", raw)
+        return 4
+
+
+def _full_review_on_required_failure() -> bool:
+    return os.environ.get("OMEGA_REVIEW_FULL_ON_REQUIRED_FAILURE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _chat(run_id: str, llm: BaseLLM, node: str, messages: list[dict]) -> str:
+    with timed(run_id, "llm", node, {"messages": len(messages)}):
+        return llm.chat(messages)
+
+
+def _infer_requirements_from_imports(run_id: str, files: list[FileChange]) -> str:
+    """Build requirements.txt content from Python imports in generated files."""
+    import ast
+
+    volume = VOLUMES_DIR / run_id
+    modules: set[str] = set()
+    for fc in files:
+        if not fc.path.endswith(".py"):
+            continue
+        path = volume / fc.path
+        if not path.exists():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            logger.warning("[Deps] Skipping import scan for syntax-invalid file: %s", fc.path)
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                modules.add(node.module.split(".", 1)[0])
+
+    stdlib = getattr(sys, "stdlib_module_names", set())
+    local_modules = {
+        Path(fc.path).stem
+        for fc in files
+        if fc.path.endswith(".py")
+    }
+    packages: set[str] = set()
+    for module in modules:
+        if module in stdlib or module in local_modules:
+            continue
+        if any(module.startswith(prefix) for prefix in _COMMON_LOCAL_MODULE_PREFIXES):
+            continue
+        package = _IMPORT_PACKAGE_MAP.get(module)
+        if package:
+            packages.add(package)
+
+    # Starlette/FastAPI TestClient imports httpx at runtime.
+    if {"fastapi", "starlette"} & packages:
+        packages.add("httpx")
+
+    return "\n".join(sorted(packages)) + ("\n" if packages else "")
+
+
 def gate_failure_context(
     gate_evidence: list[ToolEvidence],
     roles: set[str] | None = None,
@@ -95,7 +191,7 @@ def gate_failure_context(
     """
     failed = [
         e for e in gate_evidence
-        if not e.passed and (roles is None or e.role in roles)
+        if not e.passed and (roles is None or not e.role or e.role in roles)
     ]
     if not failed:
         return ""
@@ -106,6 +202,17 @@ def gate_failure_context(
             lines.append(f"Diagnosis: {e.diagnosis}")
         lines.append(f"Full output:\n{e.findings}")
     return "\n".join(lines)
+
+
+def _diagnosis_context(gate_evidence: list[ToolEvidence]) -> str:
+    """Backward-compatible Stage 4 helper name."""
+    failed = [e for e in gate_evidence if not e.passed and e.diagnosis]
+    if not failed:
+        return ""
+    lines = ["Prior review loop failures (fix these):\n"]
+    for e in failed:
+        lines.append(f"  [{e.tool_name}] {e.diagnosis}\n")
+    return "".join(lines)
 
 
 def _inspect_module_exports(file_path) -> str:
@@ -242,7 +349,7 @@ def tech_lead_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         {"role": "user", "content": user_content},
     ]
 
-    reply = _llm.chat(messages)
+    reply = _chat(state.run_id, _llm, "tech_lead_node", messages)
 
     try:
         parsed = json.loads(_extract_json(reply))
@@ -311,8 +418,7 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             except OSError:
                 pass
 
-    changes = []
-    for req in state.requirements:
+    def _generate_impl(req: SDLCRequirement) -> tuple[SDLCRequirement, str, str]:
         rel_path = f"src/{req.id.lower().replace('-', '_')}_impl.py"
 
         system_prompt = (
@@ -345,7 +451,7 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             {"role": "user", "content": user_content},
         ]
 
-        code = _llm.chat(messages).strip()
+        code = _chat(state.run_id, _llm, "dev_node", messages).strip()
         # Strip markdown fences the LLM sometimes wraps around code blocks.
         # Leaving them in causes E999 SyntaxError in ruff on every loop 1.
         code = re.sub(r"^```[^\n]*\n", "", code)
@@ -353,7 +459,17 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         tag = f"# Requirement: {req.id}"
         if not code.startswith(tag):
             code = f"{tag}\n{code}"
+        return req, rel_path, code
 
+    concurrency = min(_llm_concurrency(), max(1, len(state.requirements)))
+    if concurrency > 1 and len(state.requirements) > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            generated = list(pool.map(_generate_impl, state.requirements))
+    else:
+        generated = [_generate_impl(req) for req in state.requirements]
+
+    changes = []
+    for req, rel_path, code in generated:
         fc = write_file(
             run_id=state.run_id,
             path=rel_path,
@@ -370,50 +486,15 @@ def dev_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
     # Scanning both dirs ensures test-only deps (e.g. httpx for TestClient,
     # requests-mock, etc.) are included alongside runtime deps.
     all_files: list[FileChange] = list(changes) + list(state.tests_written)
-    all_code = "\n\n".join(
-        f"# --- {fc.path} ---\n" + (VOLUMES_DIR / state.run_id / fc.path).read_text(encoding="utf-8")
-        for fc in all_files
-        if fc.path.endswith(".py") and (VOLUMES_DIR / state.run_id / fc.path).exists()
-    )
-    req_system = (
-        "You are a dependency analyst.\n"
-        "Given source and test files, output ONLY a valid requirements file\n"
-        "with one package per line, no version pins unless critical.\n"
-        "Include ALL third-party packages needed at both runtime AND test time.\n"
-        "No comments. No extras."
-    )
-    req_user = f"Produce requirements.txt for this project:\n\n{all_code[:10000]}"
-    req_content = _llm.chat([
-        {"role": "system", "content": req_system},
-        {"role": "user", "content": req_user},
-    ]).strip()
-    # Strip any markdown fencing the LLM might add
-    req_content = re.sub(r"^```[^\n]*\n", "", req_content)
-    req_content = re.sub(r"\n```$", "", req_content).strip()
+    req_content = _infer_requirements_from_imports(state.run_id, all_files).strip()
     write_file(
         run_id=state.run_id,
         path="requirements.txt",
-        content=req_content + "\n",
+        content=(req_content + "\n") if req_content else "",
         requirement_id="DEPS",
-        rationale="LLM-inferred runtime dependencies for the generated project.",
+        rationale="Import-scanned runtime/test dependencies for the generated project.",
     )
     logger.info("[Dev] Wrote requirements.txt.")
-
-    # Invalidate any cached .deps so the next review cycle re-installs fresh.
-    import shutil
-    deps_cache = VOLUMES_DIR / state.run_id / ".deps"
-    if deps_cache.exists():
-        try:
-            shutil.rmtree(deps_cache)
-            logger.info("[Dev] Cleared .deps cache — will reinstall on next review.")
-        except PermissionError:
-            # Docker writes .deps as root; mark as stale instead of deleting.
-            # _ensure_deps_installed will see this marker and force reinstall.
-            (VOLUMES_DIR / state.run_id / ".deps-stale").touch()
-            logger.info("[Dev] Cannot remove .deps (root-owned); wrote .deps-stale marker.")
-    # Also clear the in-process install cache so runners.py re-runs install_deps.
-    import src.tools.runners as _runners
-    _runners._deps_installed.discard(state.run_id)
 
     state.current_phase = "testing"
     logger.info("[Dev] Done. %d files written.", len(state.files_changed))
@@ -443,8 +524,7 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             except OSError:
                 pass
 
-    tests = []
-    for req in state.requirements:
+    def _generate_test(req: SDLCRequirement) -> tuple[SDLCRequirement, str, str]:
         rel_path = f"tests/test_{req.id.lower().replace('-', '_')}.py"
         impl_module = req.id.lower().replace("-", "_") + "_impl"
         impl_path = f"src/{impl_module}.py"
@@ -501,14 +581,24 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             {"role": "user", "content": user_content},
         ]
 
-        code = _llm.chat(messages).strip()
+        code = _chat(state.run_id, _llm, "qa_node", messages).strip()
         # Strip markdown fences — same issue as dev_node, kills E999 on loop 1.
         code = re.sub(r"^```[^\n]*\n", "", code)
         code = re.sub(r"\n```$", "", code).strip()
         tag = f"# Requirement: {req.id}"
         if not code.startswith(tag):
             code = f"{tag}\n{code}"
+        return req, rel_path, code
 
+    concurrency = min(_llm_concurrency(), max(1, len(state.requirements)))
+    if concurrency > 1 and len(state.requirements) > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            generated_tests = list(pool.map(_generate_test, state.requirements))
+    else:
+        generated_tests = [_generate_test(req) for req in state.requirements]
+
+    tests = []
+    for req, rel_path, code in generated_tests:
         fc = write_file(
             run_id=state.run_id,
             path=rel_path,
@@ -520,6 +610,20 @@ def qa_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
         logger.info("[QA] Wrote %s (%d chars).", rel_path, len(code))
 
     state.tests_written = tests
+
+    # Regenerate requirements after tests are written so test-only imports are
+    # available before the review node installs dependencies.
+    all_files: list[FileChange] = list(state.files_changed) + list(tests)
+    req_content = _infer_requirements_from_imports(state.run_id, all_files).strip()
+    write_file(
+        run_id=state.run_id,
+        path="requirements.txt",
+        content=(req_content + "\n") if req_content else "",
+        requirement_id="DEPS",
+        rationale="Import-scanned runtime/test dependencies for the generated project.",
+    )
+    logger.info("[QA] Refreshed requirements.txt.")
+
     state.current_phase = "review"
     logger.info("[QA] Done. %d test files written.", len(state.tests_written))
     return state
@@ -556,15 +660,22 @@ def review_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
     qt = state.quality_thresholds
     evidence: list[ToolEvidence] = []
 
-    # --- Required ---
-    evidence.append(run_ruff(state.run_id))
-    evidence.append(run_pytest(state.run_id, min_coverage=qt.min_test_coverage))
+    with shared_review_sandbox(state.run_id):
+        # --- Required ---
+        evidence.append(run_ruff(state.run_id))
+        evidence.append(run_pytest(state.run_id, min_coverage=qt.min_test_coverage))
 
-    # --- Optional ---
-    evidence.append(run_mypy(state.run_id, enforce=qt.enforce_type_hints))
-    evidence.append(run_bandit(state.run_id))
-    evidence.append(run_pip_audit(state.run_id))
-    evidence.append(run_complexity_check(state.run_id, max_complexity=qt.max_cyclomatic_complexity))
+        required_failed_now = [
+            e for e in evidence if e.tool_name in _REQUIRED_TOOLS and not e.passed
+        ]
+        if required_failed_now and not _full_review_on_required_failure():
+            logger.info("[Review] Required gates failed; skipping optional gates for faster repair loop.")
+        else:
+            # --- Optional ---
+            evidence.append(run_mypy(state.run_id, enforce=qt.enforce_type_hints))
+            evidence.append(run_bandit(state.run_id))
+            evidence.append(run_pip_audit(state.run_id))
+            evidence.append(run_complexity_check(state.run_id, max_complexity=qt.max_cyclomatic_complexity))
 
     # Populate diagnosis on failures
     for ev in evidence:
@@ -681,9 +792,11 @@ def review_node(state: SDLCState, llm: BaseLLM | None = None) -> SDLCState:
             stale.unlink(missing_ok=True)
         from src.sandbox.manager import get_sandbox_manager
         install_rc, install_out = get_sandbox_manager().install_deps(state.run_id)
-        _runners._deps_installed.add(state.run_id)
 
         if install_rc == 0:
+            _runners._deps_installed.add(state.run_id)
+            if req_path.exists():
+                _runners._write_deps_hash(state.run_id, _runners._requirements_hash(req_path))
             # Real PyPI packages — reinstall succeeded, re-run gates.
             logger.info("[Review] Dep install succeeded — re-running gates.")
             state.current_phase = "review"

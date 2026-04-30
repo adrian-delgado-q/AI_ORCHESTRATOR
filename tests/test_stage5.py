@@ -458,3 +458,71 @@ class TestGetSandboxManager:
         monkeypatch.setattr(mgr_mod, "_manager", mock)
         from src.sandbox.manager import get_sandbox_manager
         assert get_sandbox_manager() is mock
+
+
+class TestSandboxPerformanceOptimizations:
+    def test_deps_install_skips_when_requirements_hash_unchanged(self, monkeypatch, tmp_path):
+        import src.tools.runners as runners_mod
+
+        run_id = "deps-cache"
+        run_dir = tmp_path / run_id
+        deps_dir = run_dir / ".deps"
+        deps_dir.mkdir(parents=True)
+        (deps_dir / "installed.txt").write_text("ok")
+        req_file = run_dir / "requirements.txt"
+        req_file.write_text("fastapi\n")
+        monkeypatch.setattr(runners_mod, "VOLUMES_DIR", tmp_path)
+        runners_mod._write_deps_hash(run_id, runners_mod._requirements_hash(req_file))
+        runners_mod._deps_installed.discard(run_id)
+
+        mock_mgr = MagicMock()
+        monkeypatch.setattr("src.sandbox.manager._manager", mock_mgr)
+
+        runners_mod._ensure_deps_installed(run_id)
+
+        mock_mgr.install_deps.assert_not_called()
+        assert run_id in runners_mod._deps_installed
+
+    def test_deps_install_runs_when_requirements_hash_changes(self, monkeypatch, tmp_path):
+        import src.tools.runners as runners_mod
+
+        run_id = "deps-cache-changed"
+        run_dir = tmp_path / run_id
+        deps_dir = run_dir / ".deps"
+        deps_dir.mkdir(parents=True)
+        (deps_dir / "installed.txt").write_text("ok")
+        req_file = run_dir / "requirements.txt"
+        req_file.write_text("fastapi\n")
+        monkeypatch.setattr(runners_mod, "VOLUMES_DIR", tmp_path)
+        runners_mod._write_deps_hash(run_id, "old-hash")
+        runners_mod._deps_installed.discard(run_id)
+
+        mock_mgr = MagicMock()
+        mock_mgr.install_deps.return_value = (0, "installed")
+        monkeypatch.setattr("src.sandbox.manager._manager", mock_mgr)
+
+        runners_mod._ensure_deps_installed(run_id)
+
+        mock_mgr.install_deps.assert_called_once_with(run_id)
+        assert runners_mod._deps_hash_matches(run_id, runners_mod._requirements_hash(req_file))
+
+    def test_shared_review_sandbox_reuses_one_container_and_cleans_up(self, monkeypatch):
+        import src.tools.runners as runners_mod
+
+        monkeypatch.setattr(runners_mod, "SANDBOX_ENABLED", True)
+        monkeypatch.setattr(runners_mod, "_ensure_deps_installed", MagicMock())
+
+        mock_ref = MagicMock()
+        mock_ref.run_id = "review-run"
+        mock_mgr = MagicMock()
+        mock_mgr.create_sandbox.return_value = mock_ref
+        mock_mgr.exec_in_sandbox.side_effect = [(0, "ruff ok"), (0, "pytest ok")]
+        monkeypatch.setattr("src.sandbox.manager._manager", mock_mgr)
+
+        with runners_mod.shared_review_sandbox("review-run"):
+            runners_mod._exec("review-run", ["ruff", "check", "/workspace/src/"])
+            runners_mod._exec("review-run", ["pytest", "/workspace/tests/"])
+
+        mock_mgr.create_sandbox.assert_called_once()
+        assert mock_mgr.exec_in_sandbox.call_count == 2
+        mock_mgr.destroy_sandbox.assert_called_once_with(mock_ref)

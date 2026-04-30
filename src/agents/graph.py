@@ -73,6 +73,7 @@ def _route_after_supervisor(state: SDLCState) -> str:
 
 def build_graph() -> StateGraph:
     """Build and compile the Omega LangGraph state machine."""
+    from src.core.timing import timed
     from src.state.persistence import save_state
 
     graph = StateGraph(dict)
@@ -82,7 +83,8 @@ def build_graph() -> StateGraph:
     def _wrap(fn):
         def _node(state_dict: dict) -> dict:
             s = SDLCState.model_validate(state_dict)
-            updated = fn(s)
+            with timed(s.run_id, "node", fn.__name__, {"phase": s.current_phase}):
+                updated = fn(s)
             save_state(updated)
             return updated.model_dump()
         _node.__name__ = fn.__name__
