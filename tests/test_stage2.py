@@ -171,8 +171,10 @@ class TestStage2EndToEnd:
     def test_graph_run_writes_real_files(self, tmp_path, monkeypatch):
         import src.io.workspace as ws
         import src.state.persistence as pers
+        import src.tools.runners as runners
         monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
         monkeypatch.setattr(pers, "RUNS_DIR", tmp_path / "runs")
+        monkeypatch.setattr(runners, "VOLUMES_DIR", tmp_path / "volumes")
 
         from src.agents.graph import omega_graph
 
@@ -200,8 +202,10 @@ class TestStage2EndToEnd:
     def test_state_json_has_no_code_blobs(self, tmp_path, monkeypatch):
         import src.io.workspace as ws
         import src.state.persistence as pers
+        import src.tools.runners as runners
         monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
         monkeypatch.setattr(pers, "RUNS_DIR", tmp_path / "runs")
+        monkeypatch.setattr(runners, "VOLUMES_DIR", tmp_path / "volumes")
 
         from src.agents.graph import omega_graph
 

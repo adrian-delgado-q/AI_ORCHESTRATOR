@@ -24,9 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 def _route_after_review(state: SDLCState) -> str:
-    """Route back to dev on gate failure (up to 3 loops), else forward."""
-    failed = any(not e.passed for e in state.gate_evidence)
-    if failed and state.loop_count < 3:
+    """Route based on the phase review_node set.
+
+    review_node is authoritative: it sets current_phase='implementation' when
+    required gates fail and 'release' when they all pass.  We trust that
+    decision here rather than re-evaluating evidence so that the required-vs-
+    optional distinction is owned in one place.
+    """
+    if state.current_phase == "implementation" and state.loop_count < 3:
         logger.info("[Router] Review failed (loop %d). Routing back to dev.", state.loop_count)
         return "dev"
     return "release_engineer"

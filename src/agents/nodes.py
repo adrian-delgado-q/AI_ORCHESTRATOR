@@ -1,7 +1,9 @@
-"""LangGraph agent nodes — Stage 2.
+"""LangGraph agent nodes — Stage 3.
 
 Each node receives SDLCState, updates it, and returns it.
 Stage 2: dev_node and qa_node write real files via src.io.workspace.
+Stage 3: review_node calls real subprocess tools; release_engineer_node
+         blocks completion when required gates fail.
 Real LLM calls are added in Stage 4.
 """
 from __future__ import annotations
@@ -10,6 +12,14 @@ import logging
 
 from src.io.workspace import write_file
 from src.state.schema import SDLCRequirement, SDLCState, ToolEvidence
+from src.tools.runners import (
+    run_bandit,
+    run_complexity_check,
+    run_mypy,
+    run_pip_audit,
+    run_pytest,
+    run_ruff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +106,24 @@ def qa_node(state: SDLCState) -> SDLCState:
     tests = []
     for req in state.requirements:
         rel_path = f"tests/test_{req.id.lower().replace('-', '_')}.py"
+        fn_name = f"stub_{req.id.lower().replace('-', '_')}"
+        module_name = f"{req.id.lower().replace('-', '_')}_impl"
         content = (
             f"# Requirement: {req.id}\n"
             f"# {req.description}\n"
             f"\n"
+            f"import sys\n"
+            f"from pathlib import Path\n"
+            f"\n"
+            f"sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))\n"
+            f"\n"
+            f"from {module_name} import {fn_name}  # noqa: E402\n"
+            f"\n"
+            f"\n"
             f"def test_{req.id.lower().replace('-', '_')}():\n"
             f"    \"\"\"Stub test — replaced by real tests in Stage 4.\"\"\"\n"
-            f"    pass\n"
+            f"    result = {fn_name}()\n"
+            f"    assert result is None  # stub returns None\n"
         )
         fc = write_file(
             run_id=state.run_id,
@@ -123,25 +144,41 @@ def qa_node(state: SDLCState) -> SDLCState:
 # 4. Review — deterministic gates
 # ---------------------------------------------------------------------------
 
+# Required gates — failure triggers a dev loop.
+_REQUIRED_TOOLS = {"ruff", "pytest"}
+
+
 def review_node(state: SDLCState) -> SDLCState:
     logger.info("[Review] Running quality gates...")
     state.current_phase = "review"
 
-    # Stage 1: all gates pass (real tool calls added in Stage 3)
-    state.gate_evidence = [
-        ToolEvidence(tool_name="ruff", passed=True, findings="No issues (stub)"),
-        ToolEvidence(tool_name="pytest", passed=True, findings="All tests passed (stub)"),
+    qt = state.quality_thresholds
+    evidence: list[ToolEvidence] = []
+
+    # --- Required ---
+    evidence.append(run_ruff(state.run_id))
+    evidence.append(run_pytest(state.run_id, min_coverage=qt.min_test_coverage))
+
+    # --- Optional ---
+    evidence.append(run_mypy(state.run_id, enforce=qt.enforce_type_hints))
+    evidence.append(run_bandit(state.run_id))
+    evidence.append(run_pip_audit(state.run_id))
+    evidence.append(run_complexity_check(state.run_id, max_complexity=qt.max_cyclomatic_complexity))
+
+    state.gate_evidence = evidence
+
+    required_failed = [
+        e for e in evidence if e.tool_name in _REQUIRED_TOOLS and not e.passed
     ]
 
-    all_passed = all(e.passed for e in state.gate_evidence)
-
-    if all_passed:
+    if not required_failed:
         state.current_phase = "release"
-        logger.info("[Review] All gates passed.")
+        logger.info("[Review] All required gates passed.")
     else:
         state.loop_count += 1
         state.current_phase = "implementation"
-        logger.warning("[Review] Gates failed. Loop %d.", state.loop_count)
+        failed_names = [e.tool_name for e in required_failed]
+        logger.warning("[Review] Required gates failed: %s. Loop %d.", failed_names, state.loop_count)
 
     return state
 
@@ -153,6 +190,23 @@ def review_node(state: SDLCState) -> SDLCState:
 def release_engineer_node(state: SDLCState) -> SDLCState:
     logger.info("[ReleaseEngineer] Validating traceability and generating release notes...")
     state.current_phase = "release"
+
+    # Safety net: block done if any required gate evidence is a failure.
+    # (review_node normally catches this, but RE is the hard stop.)
+    required_failures = [
+        e for e in state.gate_evidence
+        if e.tool_name in _REQUIRED_TOOLS and not e.passed
+    ]
+    if required_failures:
+        failed_names = [e.tool_name for e in required_failures]
+        logger.error(
+            "[ReleaseEngineer] Blocking release — required gates still failing: %s",
+            failed_names,
+        )
+        # Do NOT increment loop_count here — review_node already counted this loop.
+        # Set phase back to implementation so supervisor can escalate.
+        state.current_phase = "implementation"
+        return state
 
     # Check every requirement has at least one file and one test
     req_ids = {r.id for r in state.requirements}
@@ -166,7 +220,6 @@ def release_engineer_node(state: SDLCState) -> SDLCState:
     if missing_tests:
         logger.warning("[ReleaseEngineer] Missing tests for: %s", missing_tests)
 
-    # Stage 1: generate stub release notes
     state.release_notes = (
         f"# Release Notes — {state.run_id}\n\n"
         f"**Objective:** {state.objective}\n\n"
