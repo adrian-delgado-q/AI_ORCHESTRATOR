@@ -1,0 +1,69 @@
+site_name: Lean Omega — AI SDLC Orchestrator
+site_url: https://adrian-delgado-q.github.io/AI_ORCHESTRATOR/
+site_author: Adrian Delgado
+site_description: >-
+  Multi-agent, LangGraph-powered orchestrator that drives an entire software
+  development lifecycle — from goal definition to tested, sandboxed code.
+
+repo_name: adrian-delgado-q/AI_ORCHESTRATOR
+repo_url: https://github.com/adrian-delgado-q/AI_ORCHESTRATOR
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - content.code.annotate
+    - content.code.copy
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Setup: setup.md
+  - Architecture: architecture.md
+  - Goal YAML Reference: goal-yaml.md
+  - Configuration: configuration.md
+  - Running the Orchestrator: running.md
+  - Stages Roadmap: stages.md
+  - Contributing: contributing.md
