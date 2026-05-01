@@ -1,8 +1,8 @@
 """Stage 2 tests — real file I/O, sha256 hashing, node disk writes."""
 from __future__ import annotations
 
+import hashlib
 import json
-from pathlib import Path
 
 import pytest
 
@@ -14,11 +14,10 @@ from src.state.schema import SDLCState
 # workspace.py — write_file / read_file
 # ---------------------------------------------------------------------------
 
-class TestWorkspaceIO:
-    def test_write_file_creates_file(self, tmp_path, monkeypatch):
-        import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
 
+class TestWorkspaceIO:
+    def test_write_file_creates_file(self, tmp_dirs):
+        import src.io.workspace as ws
         fc = ws.write_file(
             run_id="test-run",
             path="src/hello.py",
@@ -26,15 +25,12 @@ class TestWorkspaceIO:
             requirement_id="REQ-001",
             rationale="Test write",
         )
-
-        target = tmp_path / "volumes" / "test-run" / "src" / "hello.py"
+        target = tmp_dirs / "volumes" / "test-run" / "src" / "hello.py"
         assert target.exists()
         assert target.read_text(encoding="utf-8") == "print('hello')\n"
 
-    def test_write_file_returns_file_change_with_hash(self, tmp_path, monkeypatch):
+    def test_write_file_returns_file_change_with_hash(self, tmp_dirs):
         import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-
         fc = ws.write_file(
             run_id="test-run",
             path="src/hello.py",
@@ -42,76 +38,54 @@ class TestWorkspaceIO:
             requirement_id="REQ-001",
             rationale="Test hash",
         )
-
         assert fc.requirement_id == "REQ-001"
         assert fc.path == "src/hello.py"
-        assert len(fc.hash) == 64  # sha256 hex digest
-        assert fc.hash != ""
+        assert len(fc.hash) == 64
 
-    def test_write_file_hash_is_correct_sha256(self, tmp_path, monkeypatch):
-        import hashlib
+    def test_write_file_hash_is_correct_sha256(self, tmp_dirs):
         import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-
         content = "def foo(): pass\n"
-        fc = ws.write_file(
-            run_id="test-run",
-            path="src/foo.py",
-            content=content,
-            requirement_id="REQ-002",
-            rationale="Hash check",
-        )
-
-        expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        fc = ws.write_file(run_id="test-run", path="src/foo.py", content=content,
+                           requirement_id="REQ-002", rationale="Hash check")
+        expected = hashlib.sha256(content.encode()).hexdigest()
         assert fc.hash == expected
 
-    def test_read_file_round_trips_content(self, tmp_path, monkeypatch):
+    def test_read_file_round_trips_content(self, tmp_dirs):
         import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-
         content = "x = 42\n"
-        ws.write_file(
-            run_id="test-run",
-            path="src/x.py",
-            content=content,
-            requirement_id="REQ-003",
-            rationale="Round trip",
-        )
+        ws.write_file(run_id="test-run", path="src/x.py", content=content,
+                      requirement_id="REQ-003", rationale="Round trip")
+        assert ws.read_file("test-run", "src/x.py") == content
 
-        result = ws.read_file("test-run", "src/x.py")
-        assert result == content
-
-    def test_read_file_missing_raises(self, tmp_path, monkeypatch):
+    def test_read_file_missing_raises(self, tmp_dirs):
         import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-
         with pytest.raises(FileNotFoundError):
             ws.read_file("test-run", "nonexistent.py")
 
-    def test_write_file_creates_parent_dirs(self, tmp_path, monkeypatch):
+    def test_write_file_creates_parent_dirs(self, tmp_dirs):
         import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
+        ws.write_file(run_id="test-run", path="deep/nested/file.py", content="pass\n",
+                      requirement_id="REQ-004", rationale="Nested dirs")
+        assert (tmp_dirs / "volumes" / "test-run" / "deep" / "nested" / "file.py").exists()
 
-        ws.write_file(
-            run_id="test-run",
-            path="deeply/nested/dir/file.py",
-            content="pass\n",
-            requirement_id="REQ-004",
-            rationale="Nested dirs",
-        )
-
-        assert (tmp_path / "volumes" / "test-run" / "deeply" / "nested" / "dir" / "file.py").exists()
+    def test_write_file_overwrite(self, tmp_dirs):
+        import src.io.workspace as ws
+        ws.write_file(run_id="test-run", path="src/f.py", content="a = 1\n",
+                      requirement_id="REQ-001", rationale="first")
+        fc2 = ws.write_file(run_id="test-run", path="src/f.py", content="a = 2\n",
+                            requirement_id="REQ-001", rationale="overwrite")
+        assert ws.read_file("test-run", "src/f.py") == "a = 2\n"
+        assert fc2.hash == hashlib.sha256(b"a = 2\n").hexdigest()
 
 
 # ---------------------------------------------------------------------------
 # dev_node and qa_node write real files
 # ---------------------------------------------------------------------------
 
-class TestNodeFileWrites:
-    def _make_state(self, tmp_path, monkeypatch) -> SDLCState:
-        import src.io.workspace as ws
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
 
+class TestNodeFileWrites:
+    def _run_through_tech_lead(self, tmp_dirs):
+        import src.io.workspace as ws  # already patched by tmp_dirs
         goal = OmegaGoal(
             goal_id="stage2-test-001",
             objective="Test real file writes",
@@ -119,63 +93,43 @@ class TestNodeFileWrites:
         )
         from src.agents.nodes import tech_lead_node
         state = SDLCState.from_goal(goal)
-        state = tech_lead_node(state)
-        return state
+        return tech_lead_node(state)
 
-    def test_dev_node_populates_files_changed_with_hashes(self, tmp_path, monkeypatch):
+    def test_dev_node_populates_files_changed_with_hashes(self, tmp_dirs):
         from src.agents.nodes import dev_node
-        state = self._make_state(tmp_path, monkeypatch)
-        state = dev_node(state)
-
+        state = dev_node(self._run_through_tech_lead(tmp_dirs))
         assert len(state.files_changed) >= 1
         for fc in state.files_changed:
-            assert fc.hash != "", f"FileChange {fc.path} has empty hash"
-            assert len(fc.hash) == 64
+            assert len(fc.hash) == 64, f"{fc.path} has bad hash length"
 
-    def test_dev_node_writes_files_to_volume(self, tmp_path, monkeypatch):
+    def test_dev_node_writes_python_files_to_volume(self, tmp_dirs):
         from src.agents.nodes import dev_node
-        state = self._make_state(tmp_path, monkeypatch)
-        state = dev_node(state)
+        state = dev_node(self._run_through_tech_lead(tmp_dirs))
+        py_files = list((tmp_dirs / "volumes" / state.run_id).rglob("*.py"))
+        assert len(py_files) >= 1
 
-        volume = tmp_path / "volumes" / state.run_id
-        py_files = list(volume.rglob("*.py"))
-        assert len(py_files) >= 1, "No .py files written by dev_node"
-
-    def test_qa_node_populates_tests_written_with_hashes(self, tmp_path, monkeypatch):
+    def test_qa_node_populates_tests_written_with_hashes(self, tmp_dirs):
         from src.agents.nodes import dev_node, qa_node
-        state = self._make_state(tmp_path, monkeypatch)
-        state = dev_node(state)
-        state = qa_node(state)
-
+        state = qa_node(dev_node(self._run_through_tech_lead(tmp_dirs)))
         assert len(state.tests_written) >= 1
         for fc in state.tests_written:
-            assert fc.hash != "", f"FileChange {fc.path} has empty hash"
             assert len(fc.hash) == 64
 
-    def test_qa_node_writes_test_files_to_volume(self, tmp_path, monkeypatch):
+    def test_qa_node_writes_test_files_to_volume(self, tmp_dirs):
         from src.agents.nodes import dev_node, qa_node
-        state = self._make_state(tmp_path, monkeypatch)
-        state = dev_node(state)
-        state = qa_node(state)
-
-        volume = tmp_path / "volumes" / state.run_id
-        test_files = list((volume / "tests").glob("test_*.py"))
-        assert len(test_files) >= 1, "No test files written by qa_node"
+        state = qa_node(dev_node(self._run_through_tech_lead(tmp_dirs)))
+        test_files = list((tmp_dirs / "volumes" / state.run_id / "tests").glob("test_*.py"))
+        assert len(test_files) >= 1
 
 
 # ---------------------------------------------------------------------------
 # End-to-end graph run
 # ---------------------------------------------------------------------------
 
-class TestStage2EndToEnd:
-    def test_graph_run_writes_real_files(self, tmp_path, monkeypatch):
-        import src.io.workspace as ws
-        import src.state.persistence as pers
-        import src.tools.runners as runners
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-        monkeypatch.setattr(pers, "RUNS_DIR", tmp_path / "runs")
-        monkeypatch.setattr(runners, "VOLUMES_DIR", tmp_path / "volumes")
 
+class TestStage2EndToEnd:
+    def test_graph_run_writes_real_files_and_no_code_blobs(self, tmp_dirs):
+        import src.state.persistence as pers
         from src.agents.graph import omega_graph
 
         goal = OmegaGoal(
@@ -187,41 +141,19 @@ class TestStage2EndToEnd:
         final_dict = omega_graph.invoke(initial.model_dump())
         final = SDLCState.model_validate(final_dict)
 
-        # Graph reaches done
         assert final.current_phase == "done"
 
-        # Real .py files exist on volume
-        volume = tmp_path / "volumes" / goal.goal_id
-        all_py = list(volume.rglob("*.py"))
-        assert len(all_py) >= 2, "Expected at least one source + one test file"
+        volume = tmp_dirs / "volumes" / goal.goal_id
+        assert len(list(volume.rglob("*.py"))) >= 2
 
-        # files_changed has hashes, no raw code key
-        assert all(len(fc.hash) == 64 for fc in final.files_changed)
-        assert all(len(fc.hash) == 64 for fc in final.tests_written)
+        # FileChange objects carry hashes, never raw code
+        for fc in final.files_changed + final.tests_written:
+            assert len(fc.hash) == 64
+            assert not hasattr(fc, "content") or not fc.__dict__.get("content")
 
-    def test_state_json_has_no_code_blobs(self, tmp_path, monkeypatch):
-        import src.io.workspace as ws
-        import src.state.persistence as pers
-        import src.tools.runners as runners
-        monkeypatch.setattr(ws, "VOLUMES_DIR", tmp_path / "volumes")
-        monkeypatch.setattr(pers, "RUNS_DIR", tmp_path / "runs")
-        monkeypatch.setattr(runners, "VOLUMES_DIR", tmp_path / "volumes")
-
-        from src.agents.graph import omega_graph
-
-        goal = OmegaGoal(
-            goal_id="no-blob-001",
-            objective="Assert no code in state",
-            success_criteria=["No blobs"],
-        )
-        initial = SDLCState.from_goal(goal)
-        final_dict = omega_graph.invoke(initial.model_dump())
-
-        pers.save_state(SDLCState.model_validate(final_dict))
-        state_path = tmp_path / "runs" / goal.goal_id / "state.json"
+        # state.json must not contain a "content" key
+        pers.save_state(final)
+        state_path = tmp_dirs / "runs" / goal.goal_id / "state.json"
         data = json.loads(state_path.read_text())
-
-        # FileChange objects must not carry a 'content' key
         for fc in data["files_changed"] + data["tests_written"]:
-            assert "content" not in fc, f"Found 'content' key in FileChange: {fc}"
-            assert fc["hash"] != ""
+            assert "content" not in fc

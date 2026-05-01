@@ -2,26 +2,21 @@
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from src.core.goal import OmegaGoal, load_goal
-from src.state.schema import SDLCState, SDLCRequirement, ToolEvidence
+from src.state.schema import SDLCState, ToolEvidence
 
 
 # ---------------------------------------------------------------------------
 # OmegaGoal schema
 # ---------------------------------------------------------------------------
 
+
 class TestOmegaGoal:
-    def test_valid_goal(self):
-        goal = OmegaGoal(
-            goal_id="test-001",
-            objective="Do something useful",
-            success_criteria=["It works"],
-        )
+    def test_valid_goal(self, make_goal):
+        goal = make_goal(goal_id="test-001", objective="Do something useful")
         assert goal.goal_id == "test-001"
         assert goal.quality_thresholds.min_test_coverage == 80
 
@@ -58,24 +53,20 @@ success_criteria:
 # SDLCState
 # ---------------------------------------------------------------------------
 
+
 class TestSDLCState:
-    def test_from_goal(self):
-        goal = OmegaGoal(
-            goal_id="state-test-001",
-            objective="Build something",
-            success_criteria=["Works"],
-        )
+    def test_from_goal(self, make_goal):
+        goal = make_goal(goal_id="state-test-001", objective="Build something")
         state = SDLCState.from_goal(goal)
         assert state.run_id == "state-test-001"
         assert state.current_phase == "planning"
         assert state.loop_count == 0
         assert state.files_changed == []
 
-    def test_state_serialization_round_trip(self):
-        goal = OmegaGoal(goal_id="round-trip-001", objective="Serialize me")
+    def test_state_serialization_round_trip(self, make_goal):
+        goal = make_goal(goal_id="round-trip-001")
         state = SDLCState.from_goal(goal)
-        dumped = state.model_dump()
-        restored = SDLCState.model_validate(dumped)
+        restored = SDLCState.model_validate(state.model_dump())
         assert restored.run_id == state.run_id
         assert restored.current_phase == state.current_phase
 
@@ -84,18 +75,18 @@ class TestSDLCState:
 # Graph end-to-end
 # ---------------------------------------------------------------------------
 
+
 class TestOmegaGraph:
-    def test_mock_run_reaches_done(self):
+    def test_mock_run_reaches_done(self, make_goal, tmp_dirs):
         from src.agents.graph import omega_graph
 
-        goal = OmegaGoal(
+        goal = make_goal(
             goal_id="graph-test-001",
             objective="End-to-end mock run",
             success_criteria=["Step A completes", "Step B completes"],
         )
         initial = SDLCState.from_goal(goal)
-        final_dict = omega_graph.invoke(initial.model_dump())
-        final = SDLCState.model_validate(final_dict)
+        final = SDLCState.model_validate(omega_graph.invoke(initial.model_dump()))
 
         assert final.current_phase == "done"
         assert final.loop_count == 0
@@ -105,20 +96,10 @@ class TestOmegaGraph:
         assert len(final.gate_evidence) >= 1
         assert final.release_notes is not None
 
-    def test_loop_cap_escalates_to_human_review(self):
-        """Force gate failure to verify loop cap + human_review escalation."""
-        from src.agents.graph import omega_graph
-
-        goal = OmegaGoal(
-            goal_id="loop-cap-test-001",
-            objective="Trigger loop cap",
-        )
-        initial = SDLCState.from_goal(goal)
-        # Pre-set loop_count to 3 and inject a failing gate so the next
-        # review routes to release_engineer, which is fine — we test the
-        # supervisor escalation path directly via the node function.
+    def test_loop_cap_escalates_to_human_review(self, make_goal):
         from src.agents.nodes import supervisor_node
-        state = SDLCState.from_goal(goal)
+
+        state = SDLCState.from_goal(make_goal(goal_id="loop-cap-test-001"))
         state.loop_count = 3
         state.current_phase = "done"
         result = supervisor_node(state)
@@ -129,13 +110,12 @@ class TestOmegaGraph:
 # Persistence
 # ---------------------------------------------------------------------------
 
+
 class TestPersistence:
-    def test_save_and_load(self, tmp_path, monkeypatch):
+    def test_save_and_load(self, tmp_dirs, make_goal):
         import src.state.persistence as pers
 
-        monkeypatch.setattr(pers, "RUNS_DIR", tmp_path / "runs")
-
-        goal = OmegaGoal(goal_id="persist-test-001", objective="Save me")
+        goal = make_goal(goal_id="persist-test-001", objective="Save me")
         state = SDLCState.from_goal(goal)
         path = pers.save_state(state)
 
