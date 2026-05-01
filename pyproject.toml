@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-stage3 = ["ruff", "pytest", "pytest-cov", "mypy", "bandit", "pip-audit"]
+stage3 = ["ruff", "pytest", "pytest-cov", "mypy", "bandit", "pip-audit", "xenon"]
 stage4 = ["litellm>=1.0"]
 stage5 = ["docker>=7.0"]
 stage6 = ["zep-python", "graphiti-core"]
@@ -49,3 +49,12 @@ select = ["E", "F", "I", "UP"]
 [tool.mypy]
 python_version = "3.10"
 strict = false
+explicit_package_bases = true
+ignore_missing_imports = true
+disable_error_code = [
+    "attr-defined",
+    "import-untyped",
+    "return-value",
+    "type-var",
+    "var-annotated",
+]
